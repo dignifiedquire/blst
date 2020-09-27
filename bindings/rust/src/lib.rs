@@ -637,15 +637,14 @@ macro_rules! sig_variant_impl {
                 });
 
                 let valid = valid_count == n_elems;
-                
+
                 let mut gtsig = blst_fp12::default();
                 if valid {
                     Pairing::aggregated(&mut gtsig, &self.point);
                 }
 
                 if let Some(acc) = acc {
-                    if valid && acc.finalverify(Some(&gtsig))
-                    {
+                    if valid && acc.finalverify(Some(&gtsig)) {
                         return BLST_ERROR::BLST_SUCCESS;
                     }
                 }
