@@ -6,22 +6,19 @@
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
 
+use once_cell::sync::Lazy;
+use rayon_core::ThreadPool;
 use std::any::Any;
-use std::mem::{transmute, MaybeUninit};
-use std::sync::{atomic::*, mpsc::channel, Arc, Mutex, Once};
-use std::{ptr, slice};
-use threadpool::ThreadPool;
+use std::mem::MaybeUninit;
+use std::ptr;
+use std::sync::{atomic::*, mpsc::channel};
 
-fn da_pool() -> ThreadPool {
-    static INIT: Once = Once::new();
-    static mut POOL: *const Mutex<ThreadPool> = 0 as *const Mutex<ThreadPool>;
-
-    INIT.call_once(|| {
-        let pool = Mutex::new(ThreadPool::default());
-        unsafe { POOL = transmute(Box::new(pool)) };
-    });
-    unsafe { (*POOL).lock().unwrap().clone() }
-}
+static POOL: Lazy<ThreadPool> = Lazy::new(|| {
+    rayon_core::ThreadPoolBuilder::new()
+        .num_threads(num_cpus::get())
+        .build()
+        .expect("failed to initialize thread pool")
+});
 
 include!("bindings.rs");
 
@@ -86,9 +83,11 @@ impl Pairing {
             )
         }
     }
+
     fn ctx(&mut self) -> *mut blst_pairing {
         self.v.as_mut_ptr() as *mut blst_pairing
     }
+
     fn const_ctx(&self) -> *const blst_pairing {
         self.v.as_ptr() as *const blst_pairing
     }
@@ -137,7 +136,7 @@ impl Pairing {
                 )
             }
         } else {
-            panic!("whaaaa?")
+            panic!("unsupported pk")
         }
     }
 
@@ -191,7 +190,7 @@ impl Pairing {
                 )
             }
         } else {
-            panic!("whaaaa?")
+            panic!("unsupported pk sig combination")
         }
     }
 
@@ -211,7 +210,7 @@ impl Pairing {
                 )
             }
         } else {
-            panic!("whaaaa?")
+            panic!("unsupported signature")
         }
     }
 
@@ -600,42 +599,20 @@ macro_rules! sig_variant_impl {
                 // TODO - check msg uniqueness?
                 // TODO - since already in object form, any need to subgroup check?
 
-                let pool = da_pool();
                 let (tx, rx) = channel();
-                let counter = Arc::new(AtomicUsize::new(0));
-                let valid = Arc::new(AtomicBool::new(true));
+                let counter = AtomicUsize::new(0);
+                let valid = AtomicBool::new(true);
 
-                // Bypass 'lifetime limitations by brute force. It works,
-                // because we explicitly join the threads...
-                let raw_pks = unsafe {
-                    transmute::<*const &PublicKey, usize>(pks.as_ptr())
-                };
-                let raw_msgs =
-                    unsafe { transmute::<*const &[u8], usize>(msgs.as_ptr()) };
-                let dst =
-                    unsafe { slice::from_raw_parts(dst.as_ptr(), dst.len()) };
-
-                let n_workers = std::cmp::min(pool.max_count(), n_elems);
+                let n_workers =
+                    std::cmp::min(POOL.current_num_threads(), n_elems);
                 for _ in 0..n_workers {
                     let tx = tx.clone();
-                    let counter = counter.clone();
-                    let valid = valid.clone();
+                    let counter = &counter;
+                    let valid = &valid;
 
-                    pool.execute(move || {
+                    POOL.scope(move |_| {
                         let mut pairing = Pairing::new($hash_or_encode, dst);
                         // reconstruct input slices...
-                        let msgs = unsafe {
-                            slice::from_raw_parts(
-                                transmute::<usize, *const &[u8]>(raw_msgs),
-                                n_elems,
-                            )
-                        };
-                        let pks = unsafe {
-                            slice::from_raw_parts(
-                                transmute::<usize, *const &PublicKey>(raw_pks),
-                                n_elems,
-                            )
-                        };
 
                         while valid.load(Ordering::Relaxed) {
                             let work = counter.fetch_add(1, Ordering::Relaxed);
@@ -644,7 +621,7 @@ macro_rules! sig_variant_impl {
                             }
                             if pairing.aggregate(
                                 &pks[work].point,
-                                &unsafe { ptr::null::<$sig_aff>().as_ref() },
+                                &ptr::null::<$sig_aff>(),
                                 &msgs[work],
                                 &[],
                             ) != BLST_ERROR::BLST_SUCCESS
@@ -719,62 +696,19 @@ macro_rules! sig_variant_impl {
                 // TODO - check msg uniqueness?
                 // TODO - since already in object form, any need to subgroup check?
 
-                let pool = da_pool();
                 let (tx, rx) = channel();
-                let counter = Arc::new(AtomicUsize::new(0));
-                let valid = Arc::new(AtomicBool::new(true));
+                let counter = AtomicUsize::new(0);
+                let valid = AtomicBool::new(true);
 
-                // Bypass 'lifetime limitations by brute force. It works,
-                // because we explicitly join the threads...
-                let raw_pks = unsafe {
-                    transmute::<*const &PublicKey, usize>(pks.as_ptr())
-                };
-                let raw_sigs = unsafe {
-                    transmute::<*const &Signature, usize>(sigs.as_ptr())
-                };
-                let raw_rands = unsafe {
-                    transmute::<*const blst_scalar, usize>(rands.as_ptr())
-                };
-                let raw_msgs =
-                    unsafe { transmute::<*const &[u8], usize>(msgs.as_ptr()) };
-                let dst =
-                    unsafe { slice::from_raw_parts(dst.as_ptr(), dst.len()) };
-
-                let n_workers = std::cmp::min(pool.max_count(), n_elems);
+                let n_workers =
+                    std::cmp::min(POOL.current_num_threads(), n_elems);
                 for _ in 0..n_workers {
                     let tx = tx.clone();
-                    let counter = counter.clone();
-                    let valid = valid.clone();
+                    let counter = &counter;
+                    let valid = &valid;
 
-                    pool.execute(move || {
+                    POOL.scope(move |_| {
                         let mut pairing = Pairing::new($hash_or_encode, dst);
-                        // reconstruct input slices...
-                        let rands = unsafe {
-                            slice::from_raw_parts(
-                                transmute::<usize, *const blst_scalar>(
-                                    raw_rands,
-                                ),
-                                n_elems,
-                            )
-                        };
-                        let msgs = unsafe {
-                            slice::from_raw_parts(
-                                transmute::<usize, *const &[u8]>(raw_msgs),
-                                n_elems,
-                            )
-                        };
-                        let sigs = unsafe {
-                            slice::from_raw_parts(
-                                transmute::<usize, *const &Signature>(raw_sigs),
-                                n_elems,
-                            )
-                        };
-                        let pks = unsafe {
-                            slice::from_raw_parts(
-                                transmute::<usize, *const &PublicKey>(raw_pks),
-                                n_elems,
-                            )
-                        };
 
                         // TODO - engage multi-point mul-n-add for larger
                         // amount of inputs...
