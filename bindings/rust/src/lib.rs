@@ -13,9 +13,12 @@ use std::mem::MaybeUninit;
 use std::ptr;
 use std::sync::{atomic::*, mpsc::channel};
 
+static NUM_THREADS: Lazy<usize> = Lazy::new(|| {
+    num_cpus::get()
+});
 static POOL: Lazy<ThreadPool> = Lazy::new(|| {
     rayon_core::ThreadPoolBuilder::new()
-        .num_threads(num_cpus::get())
+        .num_threads(*NUM_THREADS)
         .build()
         .expect("failed to initialize thread pool")
 });
@@ -604,7 +607,7 @@ macro_rules! sig_variant_impl {
                 let valid = AtomicBool::new(true);
 
                 let n_workers =
-                    std::cmp::min(POOL.current_num_threads(), n_elems);
+                    std::cmp::min(*NUM_THREADS, n_elems);
                 for _ in 0..n_workers {
                     let tx = tx.clone();
                     let counter = &counter;
@@ -612,7 +615,6 @@ macro_rules! sig_variant_impl {
 
                     POOL.scope(move |_| {
                         let mut pairing = Pairing::new($hash_or_encode, dst);
-                        // reconstruct input slices...
 
                         while valid.load(Ordering::Relaxed) {
                             let work = counter.fetch_add(1, Ordering::Relaxed);
@@ -701,7 +703,7 @@ macro_rules! sig_variant_impl {
                 let valid = AtomicBool::new(true);
 
                 let n_workers =
-                    std::cmp::min(POOL.current_num_threads(), n_elems);
+                    std::cmp::min(*NUM_THREADS, n_elems);
                 for _ in 0..n_workers {
                     let tx = tx.clone();
                     let counter = &counter;
