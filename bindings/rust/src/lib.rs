@@ -13,9 +13,7 @@ use std::mem::MaybeUninit;
 use std::ptr;
 use std::sync::{atomic::*, mpsc::channel};
 
-static NUM_THREADS: Lazy<usize> = Lazy::new(|| {
-    num_cpus::get()
-});
+static NUM_THREADS: Lazy<usize> = Lazy::new(|| num_cpus::get());
 static POOL: Lazy<ThreadPool> = Lazy::new(|| {
     rayon_core::ThreadPoolBuilder::new()
         .num_threads(*NUM_THREADS)
@@ -606,38 +604,42 @@ macro_rules! sig_variant_impl {
                 let counter = AtomicUsize::new(0);
                 let valid = AtomicBool::new(true);
 
-                let n_workers =
-                    std::cmp::min(*NUM_THREADS, n_elems);
-                for _ in 0..n_workers {
-                    let tx = tx.clone();
-                    let counter = &counter;
-                    let valid = &valid;
+                let n_workers = std::cmp::min(*NUM_THREADS, n_elems);
+                let counter = &counter;
+                let valid = &valid;
 
-                    POOL.scope(move |_| {
-                        let mut pairing = Pairing::new($hash_or_encode, dst);
+                POOL.scope(move |s| {
+                    for _ in 0..n_workers {
+                        let tx = tx.clone();
 
-                        while valid.load(Ordering::Relaxed) {
-                            let work = counter.fetch_add(1, Ordering::Relaxed);
-                            if work >= n_elems {
-                                break;
+                        s.spawn(move |_| {
+                            let mut pairing =
+                                Pairing::new($hash_or_encode, dst);
+
+                            while valid.load(Ordering::Relaxed) {
+                                let work =
+                                    counter.fetch_add(1, Ordering::Relaxed);
+                                if work >= n_elems {
+                                    break;
+                                }
+                                if pairing.aggregate(
+                                    &pks[work].point,
+                                    &ptr::null::<$sig_aff>(),
+                                    &msgs[work],
+                                    &[],
+                                ) != BLST_ERROR::BLST_SUCCESS
+                                {
+                                    valid.store(false, Ordering::Relaxed);
+                                    break;
+                                }
                             }
-                            if pairing.aggregate(
-                                &pks[work].point,
-                                &ptr::null::<$sig_aff>(),
-                                &msgs[work],
-                                &[],
-                            ) != BLST_ERROR::BLST_SUCCESS
-                            {
-                                valid.store(false, Ordering::Relaxed);
-                                break;
+                            if valid.load(Ordering::Relaxed) {
+                                pairing.commit();
                             }
-                        }
-                        if valid.load(Ordering::Relaxed) {
-                            pairing.commit();
-                        }
-                        tx.send(pairing).expect("disaster");
-                    });
-                }
+                            tx.send(pairing).expect("disaster");
+                        });
+                    }
+                });
 
                 let mut gtsig = blst_fp12::default();
                 if valid.load(Ordering::Relaxed) {
@@ -702,44 +704,48 @@ macro_rules! sig_variant_impl {
                 let counter = AtomicUsize::new(0);
                 let valid = AtomicBool::new(true);
 
-                let n_workers =
-                    std::cmp::min(*NUM_THREADS, n_elems);
-                for _ in 0..n_workers {
-                    let tx = tx.clone();
-                    let counter = &counter;
-                    let valid = &valid;
+                let n_workers = std::cmp::min(*NUM_THREADS, n_elems);
 
-                    POOL.scope(move |_| {
-                        let mut pairing = Pairing::new($hash_or_encode, dst);
+                let counter = &counter;
+                let valid = &valid;
 
-                        // TODO - engage multi-point mul-n-add for larger
-                        // amount of inputs...
-                        while valid.load(Ordering::Relaxed) {
-                            let work = counter.fetch_add(1, Ordering::Relaxed);
-                            if work >= n_elems {
-                                break;
+                POOL.scope(move |s| {
+                    for _ in 0..n_workers {
+                        let tx = tx.clone();
+
+                        s.spawn(move |_| {
+                            let mut pairing =
+                                Pairing::new($hash_or_encode, dst);
+
+                            // TODO - engage multi-point mul-n-add for larger
+                            // amount of inputs...
+                            while valid.load(Ordering::Relaxed) {
+                                let work =
+                                    counter.fetch_add(1, Ordering::Relaxed);
+                                if work >= n_elems {
+                                    break;
+                                }
+
+                                if pairing.mul_n_aggregate(
+                                    &pks[work].point,
+                                    &sigs[work].point,
+                                    &rands[work].b,
+                                    rand_bits,
+                                    msgs[work],
+                                    &[],
+                                ) != BLST_ERROR::BLST_SUCCESS
+                                {
+                                    valid.store(false, Ordering::Relaxed);
+                                    break;
+                                }
                             }
-
-                            if pairing.mul_n_aggregate(
-                                &pks[work].point,
-                                &sigs[work].point,
-                                &rands[work].b,
-                                rand_bits,
-                                msgs[work],
-                                &[],
-                            ) != BLST_ERROR::BLST_SUCCESS
-                            {
-                                valid.store(false, Ordering::Relaxed);
-                                break;
+                            if valid.load(Ordering::Relaxed) {
+                                pairing.commit();
                             }
-                        }
-                        if valid.load(Ordering::Relaxed) {
-                            pairing.commit();
-                        }
-                        tx.send(pairing).expect("disaster");
-                    });
-                }
-
+                            tx.send(pairing).expect("disaster");
+                        });
+                    }
+                });
                 let mut acc = rx.recv().unwrap();
                 for _ in 1..n_workers {
                     acc.merge(&rx.recv().unwrap());
