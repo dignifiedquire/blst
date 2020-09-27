@@ -7,15 +7,15 @@
 #![allow(non_snake_case)]
 
 use once_cell::sync::Lazy;
-use rayon_core::ThreadPool;
+use rayon::ThreadPool;
 use std::any::Any;
 use std::mem::MaybeUninit;
 use std::ptr;
-use std::sync::{atomic::*, mpsc::channel};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 static NUM_THREADS: Lazy<usize> = Lazy::new(|| num_cpus::get());
 static POOL: Lazy<ThreadPool> = Lazy::new(|| {
-    rayon_core::ThreadPoolBuilder::new()
+    rayon::ThreadPoolBuilder::new()
         .num_threads(*NUM_THREADS)
         .build()
         .expect("failed to initialize thread pool")
@@ -600,45 +600,45 @@ macro_rules! sig_variant_impl {
                 // TODO - check msg uniqueness?
                 // TODO - since already in object form, any need to subgroup check?
 
-                let (tx, rx) = channel();
-                let counter = AtomicUsize::new(0);
                 let valid = AtomicBool::new(true);
-
-                let n_workers = std::cmp::min(*NUM_THREADS, n_elems);
-                let counter = &counter;
                 let valid = &valid;
 
-                POOL.scope(move |s| {
-                    for _ in 0..n_workers {
-                        let tx = tx.clone();
+                let acc = POOL.install(|| {
+                    use rayon::prelude::*;
 
-                        s.spawn(move |_| {
+                    pks.par_iter()
+                        .zip(msgs.par_iter())
+                        .filter_map(|(pk, msg)| {
                             let mut pairing =
                                 Pairing::new($hash_or_encode, dst);
 
-                            while valid.load(Ordering::Relaxed) {
-                                let work =
-                                    counter.fetch_add(1, Ordering::Relaxed);
-                                if work >= n_elems {
-                                    break;
-                                }
-                                if pairing.aggregate(
-                                    &pks[work].point,
-                                    &ptr::null::<$sig_aff>(),
-                                    &msgs[work],
-                                    &[],
-                                ) != BLST_ERROR::BLST_SUCCESS
-                                {
-                                    valid.store(false, Ordering::Relaxed);
-                                    break;
-                                }
+                            if pairing.aggregate(
+                                &pk.point,
+                                &ptr::null::<$sig_aff>(),
+                                msg,
+                                &[],
+                            ) != BLST_ERROR::BLST_SUCCESS
+                            {
+                                valid.store(false, Ordering::Relaxed);
+                                return None;
                             }
-                            if valid.load(Ordering::Relaxed) {
-                                pairing.commit();
-                            }
-                            tx.send(pairing).expect("disaster");
-                        });
-                    }
+
+                            pairing.commit();
+                            Some(Some(pairing))
+                        })
+                        .reduce(
+                            || None,
+                            |acc, pairing| {
+                                let pairing = pairing.unwrap(); // safe as we filtered out all Nones
+                                match acc {
+                                    Some(mut acc) => {
+                                        acc.merge(&pairing);
+                                        Some(acc)
+                                    }
+                                    None => Some(pairing),
+                                }
+                            },
+                        )
                 });
 
                 let mut gtsig = blst_fp12::default();
@@ -646,18 +646,15 @@ macro_rules! sig_variant_impl {
                     Pairing::aggregated(&mut gtsig, &self.point);
                 }
 
-                let mut acc = rx.recv().unwrap();
-                for _ in 1..n_workers {
-                    acc.merge(&rx.recv().unwrap());
+                if let Some(acc) = acc {
+                    if valid.load(Ordering::Relaxed)
+                        && acc.finalverify(Some(&gtsig))
+                    {
+                        return BLST_ERROR::BLST_SUCCESS;
+                    }
                 }
 
-                if valid.load(Ordering::Relaxed)
-                    && acc.finalverify(Some(&gtsig))
-                {
-                    BLST_ERROR::BLST_SUCCESS
-                } else {
-                    BLST_ERROR::BLST_VERIFY_FAIL
-                }
+                BLST_ERROR::BLST_VERIFY_FAIL
             }
 
             pub fn fast_aggregate_verify(
@@ -700,62 +697,61 @@ macro_rules! sig_variant_impl {
                 // TODO - check msg uniqueness?
                 // TODO - since already in object form, any need to subgroup check?
 
-                let (tx, rx) = channel();
-                let counter = AtomicUsize::new(0);
                 let valid = AtomicBool::new(true);
-
-                let n_workers = std::cmp::min(*NUM_THREADS, n_elems);
-
-                let counter = &counter;
                 let valid = &valid;
 
-                POOL.scope(move |s| {
-                    for _ in 0..n_workers {
-                        let tx = tx.clone();
+                let acc = POOL.install(|| {
+                    use rayon::prelude::*;
 
-                        s.spawn(move |_| {
+                    pks.par_iter()
+                        .zip(sigs.par_iter())
+                        .zip(rands.par_iter())
+                        .zip(msgs.par_iter())
+                        .filter_map(|(((pk, sig), rand), msg)| {
                             let mut pairing =
                                 Pairing::new($hash_or_encode, dst);
 
                             // TODO - engage multi-point mul-n-add for larger
                             // amount of inputs...
-                            while valid.load(Ordering::Relaxed) {
-                                let work =
-                                    counter.fetch_add(1, Ordering::Relaxed);
-                                if work >= n_elems {
-                                    break;
-                                }
 
-                                if pairing.mul_n_aggregate(
-                                    &pks[work].point,
-                                    &sigs[work].point,
-                                    &rands[work].b,
-                                    rand_bits,
-                                    msgs[work],
-                                    &[],
-                                ) != BLST_ERROR::BLST_SUCCESS
-                                {
-                                    valid.store(false, Ordering::Relaxed);
-                                    break;
+                            if pairing.mul_n_aggregate(
+                                &pk.point,
+                                &sig.point,
+                                &rand.b,
+                                rand_bits,
+                                msg,
+                                &[],
+                            ) != BLST_ERROR::BLST_SUCCESS
+                            {
+                                valid.store(false, Ordering::Relaxed);
+                                return None;
+                            }
+
+                            pairing.commit();
+                            Some(Some(pairing))
+                        })
+                        .reduce(
+                            || None,
+                            |acc, pairing| {
+                                let pairing = pairing.unwrap(); // safe as we filtered out all Nones
+                                match acc {
+                                    Some(mut acc) => {
+                                        acc.merge(&pairing);
+                                        Some(acc)
+                                    }
+                                    None => Some(pairing),
                                 }
-                            }
-                            if valid.load(Ordering::Relaxed) {
-                                pairing.commit();
-                            }
-                            tx.send(pairing).expect("disaster");
-                        });
-                    }
+                            },
+                        )
                 });
-                let mut acc = rx.recv().unwrap();
-                for _ in 1..n_workers {
-                    acc.merge(&rx.recv().unwrap());
+
+                if let Some(acc) = acc {
+                    if valid.load(Ordering::Relaxed) && acc.finalverify(None) {
+                        return BLST_ERROR::BLST_SUCCESS;
+                    }
                 }
 
-                if valid.load(Ordering::Relaxed) && acc.finalverify(None) {
-                    BLST_ERROR::BLST_SUCCESS
-                } else {
-                    BLST_ERROR::BLST_VERIFY_FAIL
-                }
+                BLST_ERROR::BLST_VERIFY_FAIL
             }
 
             pub fn from_aggregate(agg_sig: &AggregateSignature) -> Self {
