@@ -11,7 +11,6 @@ use rayon::ThreadPool;
 use std::any::Any;
 use std::mem::MaybeUninit;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 static NUM_THREADS: Lazy<usize> = Lazy::new(|| num_cpus::get());
 static POOL: Lazy<ThreadPool> = Lazy::new(|| {
@@ -600,10 +599,7 @@ macro_rules! sig_variant_impl {
                 // TODO - check msg uniqueness?
                 // TODO - since already in object form, any need to subgroup check?
 
-                let valid = AtomicBool::new(true);
-                let valid = &valid;
-
-                let acc = POOL.install(|| {
+                let (acc, valid_count) = POOL.install(|| {
                     use rayon::prelude::*;
 
                     pks.par_iter()
@@ -619,36 +615,36 @@ macro_rules! sig_variant_impl {
                                 &[],
                             ) != BLST_ERROR::BLST_SUCCESS
                             {
-                                valid.store(false, Ordering::Relaxed);
                                 return None;
                             }
 
                             pairing.commit();
-                            Some(Some(pairing))
+                            Some((Some(pairing), 1))
                         })
                         .reduce(
-                            || None,
-                            |acc, pairing| {
+                            || (None, 0),
+                            |(acc, sum), (pairing, count)| {
                                 let pairing = pairing.unwrap(); // safe as we filtered out all Nones
                                 match acc {
                                     Some(mut acc) => {
                                         acc.merge(&pairing);
-                                        Some(acc)
+                                        (Some(acc), sum + count)
                                     }
-                                    None => Some(pairing),
+                                    None => (Some(pairing), sum + count),
                                 }
                             },
                         )
                 });
 
+                let valid = valid_count == n_elems;
+                
                 let mut gtsig = blst_fp12::default();
-                if valid.load(Ordering::Relaxed) {
+                if valid {
                     Pairing::aggregated(&mut gtsig, &self.point);
                 }
 
                 if let Some(acc) = acc {
-                    if valid.load(Ordering::Relaxed)
-                        && acc.finalverify(Some(&gtsig))
+                    if valid && acc.finalverify(Some(&gtsig))
                     {
                         return BLST_ERROR::BLST_SUCCESS;
                     }
@@ -697,10 +693,7 @@ macro_rules! sig_variant_impl {
                 // TODO - check msg uniqueness?
                 // TODO - since already in object form, any need to subgroup check?
 
-                let valid = AtomicBool::new(true);
-                let valid = &valid;
-
-                let acc = POOL.install(|| {
+                let (acc, valid_count) = POOL.install(|| {
                     use rayon::prelude::*;
 
                     pks.par_iter()
@@ -723,35 +716,36 @@ macro_rules! sig_variant_impl {
                                 &[],
                             ) != BLST_ERROR::BLST_SUCCESS
                             {
-                                valid.store(false, Ordering::Relaxed);
                                 return None;
                             }
 
                             pairing.commit();
-                            Some(Some(pairing))
+                            Some((Some(pairing), 1))
                         })
                         .reduce(
-                            || None,
-                            |acc, pairing| {
+                            || (None, 0),
+                            |(acc, sum), (pairing, count)| {
                                 let pairing = pairing.unwrap(); // safe as we filtered out all Nones
                                 match acc {
                                     Some(mut acc) => {
                                         acc.merge(&pairing);
-                                        Some(acc)
+                                        (Some(acc), sum + count)
                                     }
-                                    None => Some(pairing),
+                                    None => (Some(pairing), sum + count),
                                 }
                             },
                         )
                 });
 
-                if let Some(acc) = acc {
-                    if valid.load(Ordering::Relaxed) && acc.finalverify(None) {
-                        return BLST_ERROR::BLST_SUCCESS;
+                match acc {
+                    Some(acc) => {
+                        if valid_count == n_elems && acc.finalverify(None) {
+                            return BLST_ERROR::BLST_SUCCESS;
+                        }
+                        BLST_ERROR::BLST_VERIFY_FAIL
                     }
+                    None => BLST_ERROR::BLST_VERIFY_FAIL,
                 }
-
-                BLST_ERROR::BLST_VERIFY_FAIL
             }
 
             pub fn from_aggregate(agg_sig: &AggregateSignature) -> Self {
