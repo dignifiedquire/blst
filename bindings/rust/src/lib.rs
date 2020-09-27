@@ -6,19 +6,10 @@
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
 
-use once_cell::sync::Lazy;
-use rayon::ThreadPool;
+use rayon::prelude::*;
 use std::any::Any;
 use std::mem::MaybeUninit;
 use std::ptr;
-
-static NUM_THREADS: Lazy<usize> = Lazy::new(|| num_cpus::get());
-static POOL: Lazy<ThreadPool> = Lazy::new(|| {
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(*NUM_THREADS)
-        .build()
-        .expect("failed to initialize thread pool")
-});
 
 include!("bindings.rs");
 
@@ -599,42 +590,38 @@ macro_rules! sig_variant_impl {
                 // TODO - check msg uniqueness?
                 // TODO - since already in object form, any need to subgroup check?
 
-                let (acc, valid_count) = POOL.install(|| {
-                    use rayon::prelude::*;
+                let (acc, valid_count) = pks
+                    .par_iter()
+                    .zip(msgs.par_iter())
+                    .filter_map(|(pk, msg)| {
+                        let mut pairing = Pairing::new($hash_or_encode, dst);
 
-                    pks.par_iter()
-                        .zip(msgs.par_iter())
-                        .filter_map(|(pk, msg)| {
-                            let mut pairing =
-                                Pairing::new($hash_or_encode, dst);
+                        if pairing.aggregate(
+                            &pk.point,
+                            &ptr::null::<$sig_aff>(),
+                            msg,
+                            &[],
+                        ) != BLST_ERROR::BLST_SUCCESS
+                        {
+                            return None;
+                        }
 
-                            if pairing.aggregate(
-                                &pk.point,
-                                &ptr::null::<$sig_aff>(),
-                                msg,
-                                &[],
-                            ) != BLST_ERROR::BLST_SUCCESS
-                            {
-                                return None;
-                            }
-
-                            pairing.commit();
-                            Some((Some(pairing), 1))
-                        })
-                        .reduce(
-                            || (None, 0),
-                            |(acc, sum), (pairing, count)| {
-                                let pairing = pairing.unwrap(); // safe as we filtered out all Nones
-                                match acc {
-                                    Some(mut acc) => {
-                                        acc.merge(&pairing);
-                                        (Some(acc), sum + count)
-                                    }
-                                    None => (Some(pairing), sum + count),
+                        pairing.commit();
+                        Some((Some(pairing), 1))
+                    })
+                    .reduce(
+                        || (None, 0),
+                        |(acc, sum), (pairing, count)| {
+                            let pairing = pairing.unwrap(); // safe as we filtered out all Nones
+                            match acc {
+                                Some(mut acc) => {
+                                    acc.merge(&pairing);
+                                    (Some(acc), sum + count)
                                 }
-                            },
-                        )
-                });
+                                None => (Some(pairing), sum + count),
+                            }
+                        },
+                    );
 
                 let valid = valid_count == n_elems;
 
@@ -692,49 +679,45 @@ macro_rules! sig_variant_impl {
                 // TODO - check msg uniqueness?
                 // TODO - since already in object form, any need to subgroup check?
 
-                let (acc, valid_count) = POOL.install(|| {
-                    use rayon::prelude::*;
+                let (acc, valid_count) = pks
+                    .par_iter()
+                    .zip(sigs.par_iter())
+                    .zip(rands.par_iter())
+                    .zip(msgs.par_iter())
+                    .filter_map(|(((pk, sig), rand), msg)| {
+                        let mut pairing = Pairing::new($hash_or_encode, dst);
 
-                    pks.par_iter()
-                        .zip(sigs.par_iter())
-                        .zip(rands.par_iter())
-                        .zip(msgs.par_iter())
-                        .filter_map(|(((pk, sig), rand), msg)| {
-                            let mut pairing =
-                                Pairing::new($hash_or_encode, dst);
+                        // TODO - engage multi-point mul-n-add for larger
+                        // amount of inputs...
 
-                            // TODO - engage multi-point mul-n-add for larger
-                            // amount of inputs...
+                        if pairing.mul_n_aggregate(
+                            &pk.point,
+                            &sig.point,
+                            &rand.b,
+                            rand_bits,
+                            msg,
+                            &[],
+                        ) != BLST_ERROR::BLST_SUCCESS
+                        {
+                            return None;
+                        }
 
-                            if pairing.mul_n_aggregate(
-                                &pk.point,
-                                &sig.point,
-                                &rand.b,
-                                rand_bits,
-                                msg,
-                                &[],
-                            ) != BLST_ERROR::BLST_SUCCESS
-                            {
-                                return None;
-                            }
-
-                            pairing.commit();
-                            Some((Some(pairing), 1))
-                        })
-                        .reduce(
-                            || (None, 0),
-                            |(acc, sum), (pairing, count)| {
-                                let pairing = pairing.unwrap(); // safe as we filtered out all Nones
-                                match acc {
-                                    Some(mut acc) => {
-                                        acc.merge(&pairing);
-                                        (Some(acc), sum + count)
-                                    }
-                                    None => (Some(pairing), sum + count),
+                        pairing.commit();
+                        Some((Some(pairing), 1))
+                    })
+                    .reduce(
+                        || (None, 0),
+                        |(acc, sum), (pairing, count)| {
+                            let pairing = pairing.unwrap(); // safe as we filtered out all Nones
+                            match acc {
+                                Some(mut acc) => {
+                                    acc.merge(&pairing);
+                                    (Some(acc), sum + count)
                                 }
-                            },
-                        )
-                });
+                                None => (Some(pairing), sum + count),
+                            }
+                        },
+                    );
 
                 match acc {
                     Some(acc) => {
